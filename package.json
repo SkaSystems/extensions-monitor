@@ -1,12 +1,12 @@
 {
   "name": "extensions-monitor",
   "displayName": "extensions-monitor",
-  "description": "This is an extension that is useful for academic purposes, it monitors the extensions installed on VSCode in situations where you want to block/know what are the extensions thatinstalled  in case students are taking an exam and you need to make sure that do not install AI extensions. But other scenarios are also possible.",
-  "version": "1.11.0",
+  "description": "Monitors and blocks AI-assisted coding extensions on VSCode. Useful in academic settings or technical interviews where AI tools must not be used.",
+  "version": "1.15.0",
   "license": "Commercial",
   "publisher": "skanderturki",
   "engines": {
-    "vscode": "^1.73.0"
+    "vscode": "^1.85.0"
   },
   "keywords": [
     "VSCode extensions",
@@ -31,7 +31,7 @@
     "commands": [
       {
         "command": "extension.listInstalledExtensions",
-        "title": "List Installed Extensions"
+        "title": "Extensions Monitor: List Installed Extensions"
       }
     ],
     "keybindings": [
@@ -44,6 +44,7 @@
     ],
     "configuration": {
       "type": "object",
+      "title": "Extensions Monitor",
       "properties": {
         "monitoredExtensions.blockedList": {
           "type": "array",
@@ -85,21 +86,44 @@
             "vscjava.vscode-java-debug",
             "vscjava.vscode-maven",
             "ms-vscode-remote.remote-wsl",
-            "ecmel.vscode-html-css",
             "xabikos.JavaScriptSnippets",
             "standard.vscode-standard",
             "Wscats.html-snippets",
             "numso.prettier-standard-vscode",
             "cmstead.js-codeformer",
             "yandeu.five-server",
-            "negokaz.live-server-preview",
-            "ms-vscode.live-serve",
-            "ritwickdey.liveserver"
+            "negokaz.live-server-preview"
           ],
-          "description": "List of extensions to block.",
+          "description": "List of extensions to allow (bypasses blocking).",
           "items": {
             "type": "string"
           }
+        },
+        "extensionsMonitor.pollIntervalSeconds": {
+          "type": "number",
+          "default": 15,
+          "minimum": 5,
+          "maximum": 300,
+          "description": "How often (in seconds) to check installed extensions for banned items."
+        },
+        "extensionsMonitor.unlockGraceSeconds": {
+          "type": "number",
+          "default": 15,
+          "minimum": 5,
+          "maximum": 300,
+          "description": "Grace period (in seconds) after a successful unlock during which extensions are not re-checked."
+        },
+        "extensionsMonitor.logFilePath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to the activity log file. Leave empty to use ~/Desktop/log/extensions_log.txt."
+        },
+        "extensionsMonitor.maxPasswordAttempts": {
+          "type": "number",
+          "default": 5,
+          "minimum": 1,
+          "maximum": 20,
+          "description": "Maximum number of consecutive password attempts before the prompt stops re-appearing until the next check interval."
         }
       }
     },
@@ -128,14 +152,11 @@
     "test": "vscode-test"
   },
   "devDependencies": {
-    "@types/mocha": "^10.0.9",
+    "@types/mocha": "^10.0.10",
     "@types/node": "20.x",
-    "@types/vscode": "^1.73.0",
-    "@vscode/test-cli": "^0.0.10",
-    "@vscode/test-electron": "^2.4.1",
-    "eslint": "^9.13.0"
-  },
-  "dependencies": {
-    "crypto-js": "^4.2.0"
+    "@types/vscode": "^1.85.0",
+    "@vscode/test-cli": "^0.0.12",
+    "@vscode/test-electron": "^2.5.2",
+    "eslint": "^9.39.0"
   }
 }

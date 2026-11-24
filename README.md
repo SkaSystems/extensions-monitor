@@ -53,7 +53,7 @@ The activation status is checked once at VSCode startup from a Google Sheet, all
 
 ### Settings
 
-Access settings via `File > Preferences > Settings` and search for "monitoredExtensions":
+Access settings via `File > Preferences > Settings` and search for "monitoredExtensions" or "extensionsMonitor":
 
 ```json
 {
@@ -62,9 +62,22 @@ Access settings via `File > Preferences > Settings` and search for "monitoredExt
   ],
   "monitoredExtensions.whiteList": [
     "allowed.extension-id"
-  ]
+  ],
+  "extensionsMonitor.pollIntervalSeconds": 15,
+  "extensionsMonitor.unlockGraceSeconds": 15,
+  "extensionsMonitor.maxPasswordAttempts": 5,
+  "extensionsMonitor.logFilePath": ""
 }
 ```
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `monitoredExtensions.blockedList` | `[]` | Additional extension IDs to block on top of the hardcoded list. |
+| `monitoredExtensions.whiteList` | (pre-populated) | Additional extension IDs that bypass blocking. |
+| `extensionsMonitor.pollIntervalSeconds` | `15` | How often (seconds) installed extensions are re-checked. Range: 5–300. |
+| `extensionsMonitor.unlockGraceSeconds` | `15` | Grace period (seconds) after a successful unlock before the next check. Range: 5–300. |
+| `extensionsMonitor.maxPasswordAttempts` | `5` | Maximum consecutive password retries before the prompt stops re-appearing until the next interval. Range: 1–20. |
+| `extensionsMonitor.logFilePath` | `""` | Absolute path to the activity log. Leave empty to use `~/Desktop/log/extensions_log.txt`. |
 
 **Note**: The hardcoded blocklist in `config.js` cannot be modified through settings, ensuring AI extensions remain blocked.
 
@@ -109,13 +122,13 @@ If a student needs temporary access (e.g., to uninstall a blocked extension):
 ### Remote Activation Setup
 To enable remote activation control via Google Sheets:
 
-1. Create a "Settings" sheet in your Google Spreadsheet
+1. Create an `activation` sheet in your Google Spreadsheet
 2. Add a boolean value (`TRUE` or `FALSE`) in cell B1
 3. Add this `doGet` function to your Google Apps Script:
 
 ```javascript
 function doGet(e) {
-  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Settings");
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("activation");
   var status = sheet.getRange("B1").getValue();
 
   return ContentService
@@ -131,7 +144,7 @@ function doGet(e) {
 
 ## Requirements
 
-- VSCode version 1.73.0 or higher
+- VSCode version 1.85.0 or higher
 - Active subscription for credential verification
 
 ## Known Limitations
@@ -141,6 +154,16 @@ function doGet(e) {
 - Extensions installed after the check interval (15 seconds) won't be detected until the next cycle
 
 ## Release Notes
+
+### 1.12.0
+- Bug fixes: out-of-scope `err` reference in log writer; empty catch block; duplicate/typo entries in default whitelist; whitelist setting description copy-paste error.
+- Removed broken `encryption.js` and the unused `crypto-js` dependency.
+- Password prompt converted from recursive to iterative with configurable max attempts.
+- Four new configuration keys under `extensionsMonitor.*` (poll interval, grace, log path, max attempts).
+- `extension.listInstalledExtensions` (Ctrl+Shift+L) is now implemented and shows a quick-pick of all installed extensions with BANNED / ALLOWED / NEUTRAL badges.
+- Webview HTML moved out of `extension.js` into `media/views/*.html`.
+- Minimum VSCode version raised from 1.73.0 to 1.85.0; dev dependencies refreshed.
+- Real unit tests added for the matching logic.
 
 ### 1.11.0
 - Fixed credential validation to handle numeric responses (1/0) from Google Apps Script

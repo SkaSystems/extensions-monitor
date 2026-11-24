@@ -1,327 +1,542 @@
-const { BANNED_EXTENSIONS, WHITE_LIST_EXTENSIONS } = require('./config');
-const TIMEOUT = 15000;
+const { isExtensionBanned } = require('./lib/matcher');
 const vscode = require('vscode');
 const path = require('path');
 const fs = require('fs');
-const { checkCredentials, checkActivationStatus } = require('./password');
+const os = require('os');
+const { checkCredentials, fetchRemoteConfig } = require('./password');
+const { compareVersions, fetchLatestVersion } = require('./lib/selfUpdate');
 
-// Track last unlock time to provide grace period after password entry
+const DEFAULTS = {
+	POLL_INTERVAL_SECONDS: 15,
+	UNLOCK_GRACE_SECONDS: 15,
+	MAX_PASSWORD_ATTEMPTS: 5,
+};
+
+const REMOTE_REFRESH_MS = 60 * 60 * 1000; // 1 hour
+const SELF_UPDATE_FIRST_CHECK_MS = 30 * 1000; // let VS Code finish starting up
+const CACHED_REMOTE_KEY = 'cachedRemoteLists';
+const SELF_ID = 'skanderturki.extensions-monitor';
+
+// User settings forced while EXAM MODE is active. The student's own value is
+// saved in globalState under prevKey and restored in LECTURE MODE.
+//  - chat.disableAIFeatures: turns off built-in Copilot Chat and other built-in
+//    AI features (built-ins cannot be uninstalled and ignore extensions.allowed).
+//  - extensions.allowed: VS Code itself disables, and refuses to install, any
+//    non-built-in extension mapped to false.
+const ENFORCED = {
+	aiFeatures: { section: 'chat', key: 'disableAIFeatures', prevKey: 'aiFeaturesPrevValue' },
+	allowed: { section: 'extensions', key: 'allowed', prevKey: 'allowedExtensionsPrevValue' },
+};
+
 let lastUnlockTime = 0;
-
-// Status bar items for visual indication (left and right)
 let statusBarItemLeft;
 let statusBarItemRight;
-
-// Track if exam mode is active (from remote server)
-let isExamModeActive = true; // Default to true (fail-safe)
-
-// Reference to webview provider for updating UI
+let isExamModeActive = true;
 let viewProviderInstance;
+let extensionContext;
+let logFilePath;
+let remoteBlacklist = [];
+let remoteWhitelist = [];
+let pendingUpdateVersion = null;
 
-// Function to write to the log file
-const writeToLogFile = (logFilePath, message) => {
+const writeToLogFile = (filePath, message) => {
+	if (!filePath) return;
 	try {
-		fs.appendFile(logFilePath, `${new Date().toISOString()} - ${message}\n`, (err) => {
+		fs.appendFile(filePath, `${new Date().toISOString()} - ${message}\n`, (err) => {
 			if (err) {
 				console.error('Failed to write to log file:', err);
-			} else {
-				// Do nothing
 			}
 		});
 	} catch (error) {
-		console.error('Failed to write to log file:', err);
+		console.error('Failed to write to log file:', error);
 	}
 };
 
-// Writes in a file the current date if this extension is installed
 const logConfirmationExtensionIsInstalled = () => {
+	if (vscode.extensions.all.some(ext => ext.id === SELF_ID)) {
+		writeToLogFile(logFilePath, 'Extension extensions-monitor exists on your IDE');
+	}
+};
 
-	const installedExtensions = vscode.extensions.all.map(ext => ext.id);
+const getMonitorConfig = () => {
+	const cfg = vscode.workspace.getConfiguration('extensionsMonitor');
+	return {
+		pollIntervalSeconds: cfg.get('pollIntervalSeconds', DEFAULTS.POLL_INTERVAL_SECONDS),
+		unlockGraceSeconds: cfg.get('unlockGraceSeconds', DEFAULTS.UNLOCK_GRACE_SECONDS),
+		maxPasswordAttempts: cfg.get('maxPasswordAttempts', DEFAULTS.MAX_PASSWORD_ATTEMPTS),
+		logFilePath: cfg.get('logFilePath', ''),
+	};
+};
 
-	const yourExtensionId = 'skanderturki.extensions-monitor';
+const resolveLogFilePath = (configuredPath) => {
+	if (configuredPath && configuredPath.trim().length > 0) {
+		return configuredPath;
+	}
+	const desktopDir = path.join(os.homedir(), 'Desktop', 'log');
+	if (!fs.existsSync(desktopDir)) {
+		try {
+			fs.mkdirSync(desktopDir, { recursive: true });
+		} catch (error) {
+			console.error('Failed to create log directory:', error);
+			return null;
+		}
+	}
+	return path.join(desktopDir, 'extensions_log.txt');
+};
 
-	if (installedExtensions.includes(yourExtensionId)) {
-		writeToLogFile(process.logFilePath, "Extension extensions-monitor exists on your IDE\n");
+const applyRemoteConfig = (config) => {
+	if (!config) return false;
+	isExamModeActive = config.isActive;
+	remoteBlacklist = config.blacklist || [];
+	remoteWhitelist = config.whitelist || [];
+	if (extensionContext) {
+		extensionContext.globalState.update(CACHED_REMOTE_KEY, {
+			blacklist: remoteBlacklist,
+			whitelist: remoteWhitelist,
+		});
+	}
+	return true;
+};
+
+const loadCachedRemoteLists = () => {
+	if (!extensionContext) return;
+	const cached = extensionContext.globalState.get(CACHED_REMOTE_KEY);
+	if (cached) {
+		remoteBlacklist = Array.isArray(cached.blacklist) ? cached.blacklist : [];
+		remoteWhitelist = Array.isArray(cached.whitelist) ? cached.whitelist : [];
+	}
+};
+
+// Stable JSON for comparing setting values (object key order must not matter).
+const stableStringify = (value) => {
+	if (value && typeof value === 'object' && !Array.isArray(value)) {
+		return '{' + Object.keys(value).sort()
+			.map(k => JSON.stringify(k) + ':' + stableStringify(value[k])).join(',') + '}';
+	}
+	return JSON.stringify(value === undefined ? null : value);
+};
+
+/**
+ * Force a user-level setting to `desired`. The student's original value is
+ * saved once (null = was unset) so restoreSetting() can put it back.
+ * Returns true if the setting was changed.
+ */
+const enforceSetting = async ({ section, key, prevKey }, desired, label) => {
+	if (!extensionContext) return false;
+	const cfg = vscode.workspace.getConfiguration(section);
+	const inspected = cfg.inspect(key) || {};
+	const userOk = stableStringify(inspected.globalValue) === stableStringify(desired);
+	const workspaceOverride = inspected.workspaceValue !== undefined;
+	if (userOk && !workspaceOverride) return false;
+
+	if (extensionContext.globalState.get(prevKey) === undefined) {
+		const prev = inspected.globalValue === undefined ? null : inspected.globalValue;
+		await extensionContext.globalState.update(prevKey, prev);
+	}
+	try {
+		if (!userOk) {
+			await cfg.update(key, desired, vscode.ConfigurationTarget.Global);
+		}
+		// A workspace-level value would override the user setting.
+		if (workspaceOverride) {
+			await cfg.update(key, undefined, vscode.ConfigurationTarget.Workspace);
+		}
+		writeToLogFile(logFilePath, `${label}: ${section}.${key} enforced`);
+		return true;
+	} catch (e) {
+		console.error(`Failed to enforce ${section}.${key}:`, e);
+		writeToLogFile(logFilePath, `FAILED to enforce ${section}.${key}: ${e}`);
+		return false;
+	}
+};
+
+const restoreSetting = async ({ section, key, prevKey }) => {
+	if (!extensionContext) return;
+	const prev = extensionContext.globalState.get(prevKey);
+	if (prev === undefined) return;
+	try {
+		await vscode.workspace
+			.getConfiguration(section)
+			.update(key, prev === null ? undefined : prev, vscode.ConfigurationTarget.Global);
+		await extensionContext.globalState.update(prevKey, undefined);
+		writeToLogFile(logFilePath, `${section}.${key} restored (lecture mode)`);
+	} catch (e) {
+		console.error(`Failed to restore ${section}.${key}:`, e);
+	}
+};
+
+const getLocalLists = () => {
+	const monitoredCfg = vscode.workspace.getConfiguration('monitoredExtensions');
+	return {
+		userBlocklist: monitoredCfg.get('blockedList', []),
+		userWhitelist: monitoredCfg.get('whiteList', []),
+	};
+};
+
+const isBuiltinExtension = (extension) => !!(extension.packageJSON && extension.packageJSON.isBuiltin === true);
+
+/**
+ * extensions.allowed value: everything allowed ("*": true) except ids from the
+ * remote blacklist, the user blocklist, and installed extensions the matcher
+ * flags (keyword detection). Whitelisted ids and the monitor itself are never
+ * mapped to false. Keys are lower-cased, as VS Code matches them.
+ */
+const buildAllowedExtensionsValue = () => {
+	const { userBlocklist, userWhitelist } = getLocalLists();
+	const lower = (list) => list.filter(id => typeof id === 'string' && id.includes('.'))
+		.map(id => id.trim().toLowerCase());
+	const exempt = new Set([...lower(remoteWhitelist), ...lower(userWhitelist), SELF_ID]);
+
+	const denied = new Set([...lower(remoteBlacklist), ...lower(userBlocklist)]);
+	for (const extension of vscode.extensions.all) {
+		if (!isBuiltinExtension(extension)
+			&& isExtensionBanned(extension, userBlocklist, userWhitelist, remoteBlacklist, remoteWhitelist)) {
+			denied.add(extension.id.toLowerCase());
+		}
 	}
 
-}
+	const value = { '*': true };
+	for (const id of [...denied].sort()) {
+		if (!exempt.has(id)) value[id] = false;
+	}
+	return value;
+};
 
-// use Blocked list strategy only
+const enforceExamSettings = async () => {
+	if (!isExamModeActive) return;
+	await enforceSetting(ENFORCED.aiFeatures, true, 'Built-in AI features (Copilot Chat) disabled');
+	const changed = await enforceSetting(ENFORCED.allowed, buildAllowedExtensionsValue(), 'Banned extensions disabled');
+
+	// Banned extensions that are already running only stop after a window reload.
+	if (changed) {
+		const { userBlocklist, userWhitelist } = getLocalLists();
+		const running = vscode.extensions.all.filter(ext => !isBuiltinExtension(ext)
+			&& isExtensionBanned(ext, userBlocklist, userWhitelist, remoteBlacklist, remoteWhitelist));
+		if (running.length > 0) {
+			vscode.window.showWarningMessage(
+				`Banned extensions were disabled (${running.map(e => e.id).join(', ')}). Reload VS Code to finish.`,
+				'Reload Window'
+			).then(choice => {
+				if (choice === 'Reload Window') vscode.commands.executeCommand('workbench.action.reloadWindow');
+			});
+		}
+	}
+};
+
+const restoreExamSettings = async () => {
+	await restoreSetting(ENFORCED.aiFeatures);
+	await restoreSetting(ENFORCED.allowed);
+};
+
+/**
+ * Install a newer published version of the monitor, so students are updated
+ * even if they turned extension auto-update off. Uses VS Code's own install
+ * command, which upgrades in place; the new version runs after a reload.
+ * Skipped in development and test runs.
+ */
+const checkForSelfUpdate = async () => {
+	if (!extensionContext || extensionContext.extensionMode !== vscode.ExtensionMode.Production) return;
+	if (pendingUpdateVersion) return;
+
+	const current = extensionContext.extension.packageJSON.version;
+	const latest = await fetchLatestVersion(SELF_ID);
+	if (!latest || compareVersions(latest, current) <= 0) return;
+
+	try {
+		writeToLogFile(logFilePath, `Updating extensions-monitor ${current} -> ${latest}`);
+		await vscode.commands.executeCommand('workbench.extensions.installExtension', SELF_ID);
+		pendingUpdateVersion = latest;
+		writeToLogFile(logFilePath, `extensions-monitor ${latest} installed; active after reload`);
+		vscode.window.showInformationMessage(
+			`Extensions Monitor was updated to ${latest}. Reload VS Code to use the new version.`,
+			'Reload Window'
+		).then(choice => {
+			if (choice === 'Reload Window') vscode.commands.executeCommand('workbench.action.reloadWindow');
+		});
+	} catch (e) {
+		console.error('Self-update failed:', e);
+		writeToLogFile(logFilePath, `extensions-monitor self-update to ${latest} FAILED: ${e}`);
+	}
+};
+
 const checkExtensions = () => {
-	//checkWhitelistOnlyExtensions();
-	//checkCopilotSettings();
+	enforceExamSettings();
 	checkBlockedExtensions();
 	logConfirmationExtensionIsInstalled();
-}
-
-const checkCopilotSettings = () => {
-	const config = vscode.workspace.getConfiguration('github');
-	if (config.get('copilot.enable')) {
-		config.update('github.copilot.enable', false, vscode.ConfigurationTarget.Global)
-			.then(() => {
-				console.log('Github copilot disabled...');
-			});
-	}
-
-}
-
-// const checkWhitelistOnlyExtensions = () => {
-// 	let isCurrentlyBlocked = process.context.globalState.get('isCurrentlyBlocked');
-// 	if (isCurrentlyBlocked) {
-// 		return;
-// 	}
-
-// 	const installedExtensions = vscode.extensions.all;
-
-// 	// get IDE configured whitelist (initialized in package.json but can be changed by user)
-// 	const whitelistExtensions = vscode.workspace.getConfiguration('monitoredExtensions').get('whiteList', []);
-
-// 	for(let extension of installedExtensions){
-// 		let notfound = true;
-// 		if (! whitelistExtensions.includes(extension.id)) {
-// 			// Check hard-coded whitelist (see config.js), these cannot be changed by user
-// 			WHITE_LIST_EXTENSIONS.forEach(extensionID => {
-// 				if ((extension.id.toLowerCase() === extensionID.toLowerCase()) || (extension.id.startsWith('vscode.'))){
-// 					notfound = false;
-// 				}
-// 			})
-// 		} else {
-// 			notfound = false;
-// 		}
-// 		if (notfound) {
-// 			process.context.globalState.update('isCurrentlyBlocked', true);
-// 			promptForPassword(extension.id);
-// 			return;
-// 		}
-// 	};
-// }
+};
 
 const checkBlockedExtensions = () => {
-
-	// If exam mode is not active, skip blocking
 	if (!isExamModeActive) {
 		return;
 	}
 
-	// If the editor is currently blocked we don't re-check,
-	// the user has to enter password or re-start IDE
-	let isCurrentlyBlocked = process.context.globalState.get('isCurrentlyBlocked');
+	if (!extensionContext) {
+		return;
+	}
+
+	const isCurrentlyBlocked = extensionContext.globalState.get('isCurrentlyBlocked');
 	if (isCurrentlyBlocked) {
 		return;
 	}
 
-	// Grace period: don't block immediately after instructor unlocks
-	if (Date.now() - lastUnlockTime < TIMEOUT) {
+	const { unlockGraceSeconds } = getMonitorConfig();
+	if (Date.now() - lastUnlockTime < unlockGraceSeconds * 1000) {
 		return;
 	}
-	// Get all installed extensions
-	const installedExtensions = vscode.extensions.all;
 
-	// Define extensions you want to block 
-	// Warning: These can be removed from the IDE settings
-	const blockedExtensions = vscode.workspace.getConfiguration('monitoredExtensions').get('blockedList', []);
+	const { userBlocklist, userWhitelist } = getLocalLists();
 
-	// Manually add some extensions to block so that they cannot be removed from the IDE settings
-
-	// Check and block extensions
 	try {
-		for (let extension of installedExtensions) {
-			let found = false;
-			if (
-				blockedExtensions.includes(extension.id.toLowerCase())
-				|| ["copilot", "chatgpt", "gemini", "openai", "llama", "claude", "anthropic", "codeium", "tabnine", "cody", "amazon-q", "codewhisperer", "supermaven", "codegee", "phind", "gpt-4", "gpt4", "gpt-3", "gpt3", "ai-assist", "code-ai", "aicode", "ollama", "mistral", "codestral", "huggingface", "bard"].some(
-					substring => extension.packageJSON.description.toLowerCase().includes(substring)
-				)
-				|| ["copilot", "chatgpt", "gemini", "openai", "llama", "claude", "anthropic", "codeium", "tabnine", "cody", "amazonq", "codewhisperer", "supermaven", "codegee", "phind", "ai-code", "aicode", "ollama", "mistral", "codestral", "huggingface", "bard", "cline", "aider", "refact", "continue"].some(
-					substring => extension.id.toLowerCase().includes(substring)
-				)
-			) {
-				found = true;
-			}
-			for (let blocked of BANNED_EXTENSIONS) {
-				if (blocked.toLowerCase() === extension.id.toLowerCase()) {
-					found = true;
-					break;
-				}
-			};
-			if (found) {
-				process.context.globalState.update('isCurrentlyBlocked', true);
-				promptForPassword(extension.id);
+		for (const extension of vscode.extensions.all) {
+			if (isExtensionBanned(extension, userBlocklist, userWhitelist, remoteBlacklist, remoteWhitelist)) {
+				extensionContext.globalState.update('isCurrentlyBlocked', true);
+				promptForPassword(extension.id, isBuiltinExtension(extension));
 				return;
 			}
-		};
+		}
+	} catch (e) {
+		console.error('checkBlockedExtensions failed:', e);
 	}
-	catch (e) {
+};
 
-	}
-
-}
-
-// Update UI based on exam mode status
 function updateUIForMode(isActive) {
 	if (isActive) {
-		// EXAM MODE - Yellow/Red warnings
-		statusBarItemLeft.text = "$(shield) EXAM MODE - Monitor Active";
-		statusBarItemLeft.tooltip = "Extensions Monitor is active - AI extensions are blocked";
+		statusBarItemLeft.text = '$(shield) EXAM MODE - Monitor Active';
+		statusBarItemLeft.tooltip = 'Extensions Monitor is active - AI extensions are blocked';
 		statusBarItemLeft.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
 		statusBarItemLeft.show();
 
-		statusBarItemRight.text = "$(eye) MONITORED";
-		statusBarItemRight.tooltip = "This VSCode instance is being monitored for AI extensions";
+		statusBarItemRight.text = '$(eye) MONITORED';
+		statusBarItemRight.tooltip = 'This VSCode instance is being monitored for AI extensions';
 		statusBarItemRight.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
 		statusBarItemRight.show();
 	} else {
-		// LECTURE MODE - Green, non-intrusive
-		statusBarItemLeft.text = "$(book) LECTURE MODE";
-		statusBarItemLeft.tooltip = "Extensions Monitor is in lecture mode - AI extensions allowed";
+		statusBarItemLeft.text = '$(book) LECTURE MODE';
+		statusBarItemLeft.tooltip = 'Extensions Monitor is in lecture mode - AI extensions allowed';
 		statusBarItemLeft.backgroundColor = undefined;
 		statusBarItemLeft.show();
 
 		statusBarItemRight.hide();
 	}
 
-	// Update webview if available
 	if (viewProviderInstance && viewProviderInstance._view) {
 		viewProviderInstance.updateContent(isActive);
 	}
+}
+
+async function showInstalledExtensionsPick() {
+	const userBlocklist = vscode.workspace
+		.getConfiguration('monitoredExtensions')
+		.get('blockedList', []);
+	const userWhitelist = vscode.workspace
+		.getConfiguration('monitoredExtensions')
+		.get('whiteList', []);
+	const remoteWhitelistLower = remoteWhitelist.map(id => String(id).toLowerCase());
+
+	const items = vscode.extensions.all.map(ext => {
+		const idLower = ext.id.toLowerCase();
+		const banned = isExtensionBanned(ext, userBlocklist, userWhitelist, remoteBlacklist, remoteWhitelist);
+		const whitelisted = remoteWhitelistLower.includes(idLower)
+			|| userWhitelist.some(id => typeof id === 'string' && id.toLowerCase() === idLower);
+
+		let badge;
+		if (banned) badge = '$(error) BANNED';
+		else if (whitelisted) badge = '$(check) ALLOWED';
+		else badge = '$(circle-outline) NEUTRAL';
+
+		return {
+			label: ext.id,
+			description: badge,
+			detail: (ext.packageJSON && ext.packageJSON.displayName) || '',
+		};
+	});
+
+	await vscode.window.showQuickPick(items, {
+		title: `Installed extensions (${items.length})`,
+		placeHolder: 'Filter installed extensions…',
+		matchOnDescription: true,
+		matchOnDetail: true,
+	});
 }
 
 /**
  * @param {vscode.ExtensionContext} context
  */
 function activate(context) {
+	extensionContext = context;
 
-	// Create LEFT status bar item (initially hidden until status check completes)
 	statusBarItemLeft = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
-	statusBarItemLeft.text = "$(sync~spin) Checking...";
-	statusBarItemLeft.tooltip = "Checking extension monitor status...";
+	statusBarItemLeft.text = '$(sync~spin) Checking...';
+	statusBarItemLeft.tooltip = 'Checking extension monitor status...';
 	statusBarItemLeft.show();
 	context.subscriptions.push(statusBarItemLeft);
 
-	// Create RIGHT status bar item (initially hidden)
 	statusBarItemRight = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
 	context.subscriptions.push(statusBarItemRight);
 
-	// Register action bar view
 	viewProviderInstance = new MyViewProvider(context);
 	context.subscriptions.push(
 		vscode.window.registerWebviewViewProvider('extensions-monitor-view', viewProviderInstance)
 	);
 
-	// Print in a file the date if this extension is still installed
-	const homeDir = require('os').homedir();
-	const desktopDir = `${homeDir}/Desktop/log`;
-	if (!fs.existsSync(desktopDir)) {
-		fs.mkdirSync(desktopDir);
-	}
-	process.logFilePath = path.join(desktopDir, 'extensions_log.txt');
+	context.subscriptions.push(
+		vscode.commands.registerCommand('extension.listInstalledExtensions', showInstalledExtensionsPick)
+	);
 
-	// Check unwanted extensions
-	process.context = context;
+	const cfg = getMonitorConfig();
+	logFilePath = resolveLogFilePath(cfg.logFilePath);
 	context.globalState.update('isCurrentlyBlocked', false);
 
-	// Check activation status from remote server at startup
-	checkActivationStatus()
-		.then(isActive => {
-			isExamModeActive = isActive;
-			updateUIForMode(isActive);
+	// Seed the in-memory lists from the last-known cache before the first fetch returns.
+	loadCachedRemoteLists();
 
-			if (isActive) {
-				writeToLogFile(process.logFilePath, "EXAM MODE activated\n");
-				checkExtensions();
+	fetchRemoteConfig()
+		.then(config => {
+			if (config) {
+				applyRemoteConfig(config);
+				updateUIForMode(config.isActive);
+				if (config.isActive) {
+					writeToLogFile(logFilePath, 'EXAM MODE activated');
+					checkExtensions();
+				} else {
+					writeToLogFile(logFilePath, 'LECTURE MODE - monitoring disabled');
+					restoreExamSettings();
+				}
 			} else {
-				writeToLogFile(process.logFilePath, "LECTURE MODE - monitoring disabled\n");
+				// Network failure: fail-safe to exam mode, keep cached lists already loaded above.
+				isExamModeActive = true;
+				updateUIForMode(true);
+				writeToLogFile(logFilePath, 'EXAM MODE activated (remote unreachable, using cached lists)');
+				checkExtensions();
 			}
-		})
-		.catch(err => {
-			console.error('Failed to check activation status:', err);
-			// Default to exam mode on error (fail-safe)
-			isExamModeActive = true;
-			updateUIForMode(true);
-			checkExtensions();
 		});
 
-	const interval = setInterval(checkExtensions, TIMEOUT);
-
+	const pollInterval = setInterval(checkExtensions, cfg.pollIntervalSeconds * 1000);
 	context.subscriptions.push({
-		dispose: () => {
-			clearInterval(interval); // Clean up interval when the extension is deactivated
-		}
+		dispose: () => clearInterval(pollInterval),
 	});
-};
 
-// This method is called when your extension is deactivated
+	const firstUpdateCheck = setTimeout(checkForSelfUpdate, SELF_UPDATE_FIRST_CHECK_MS);
+	context.subscriptions.push({ dispose: () => clearTimeout(firstUpdateCheck) });
+
+	const refreshInterval = setInterval(() => {
+		checkForSelfUpdate();
+		fetchRemoteConfig().then(config => {
+			if (!config) return;
+			const wasActive = isExamModeActive;
+			applyRemoteConfig(config);
+			if (wasActive !== isExamModeActive) {
+				updateUIForMode(isExamModeActive);
+				if (isExamModeActive) enforceExamSettings();
+				else restoreExamSettings();
+				writeToLogFile(
+					logFilePath,
+					isExamModeActive ? 'Mode changed to EXAM MODE' : 'Mode changed to LECTURE MODE'
+				);
+			}
+		});
+	}, REMOTE_REFRESH_MS);
+	context.subscriptions.push({
+		dispose: () => clearInterval(refreshInterval),
+	});
+
+	context.subscriptions.push(
+		vscode.workspace.onDidChangeConfiguration(event => {
+			const watched = [...Object.values(ENFORCED).map(({ section, key }) => `${section}.${key}`), 'monitoredExtensions'];
+			if (isExamModeActive && watched.some(name => event.affectsConfiguration(name))) {
+				// No-op when values already match, so the monitor's own writes don't loop.
+				enforceExamSettings();
+			}
+			if (event.affectsConfiguration('extensionsMonitor.logFilePath')) {
+				logFilePath = resolveLogFilePath(getMonitorConfig().logFilePath);
+			}
+		})
+	);
+}
+
 function deactivate() {
-	if (statusBarItemLeft) {
-		statusBarItemLeft.dispose();
-	}
-	if (statusBarItemRight) {
-		statusBarItemRight.dispose();
-	}
-};
+	if (statusBarItemLeft) statusBarItemLeft.dispose();
+	if (statusBarItemRight) statusBarItemRight.dispose();
+}
 
-function promptForPassword(extensionID) {
-	// Show the password input box and block the UI
-	vscode.window.showInputBox({
-		title: `WARNING: ${extensionID} is a banned extension and should be removed from your IDE`,
-		prompt: `You have installed extensions that are not allowed: ${extensionID}\n
-		Please request from your instructor to unblock VSCode\n\n
-		!!`,
-		password: true,  // Makes the input field hidden for sensitive input
-		placeHolder: 'Password'
-	}).then((value) => {
+async function promptForPassword(extensionID, isBuiltin = false) {
+	const action = isBuiltin
+		? 'is built into VSCode and must be disabled (Extensions view > Built-in > Disable)'
+		: 'is a banned extension and should be removed from your IDE';
+	const { maxPasswordAttempts } = getMonitorConfig();
+
+	for (let attempt = 0; attempt < maxPasswordAttempts; attempt++) {
+		const value = await vscode.window.showInputBox({
+			title: `WARNING: ${extensionID} ${action}`,
+			prompt: `You have installed extensions that are not allowed: ${extensionID}. Please request from your instructor to unblock VSCode.`,
+			password: true,
+			placeHolder: 'email#password',
+			ignoreFocusOut: true,
+		});
+
 		if (!value) {
 			vscode.window.showErrorMessage('Missing credentials. Access denied.');
-			// Optionally, you can re-prompt the user if the password is incorrect
-			promptForPassword(extensionID); // Recursive call to keep asking for the correct password
-		} else {
-			let email = value.substring(0, value.indexOf('#'));
-			let password = value.substring(value.indexOf('#') + 1, value.length);
-			if (!email || !password) {
-				vscode.window.showErrorMessage('Missing credentials. Access denied.');
-				// Optionally, you can re-prompt the user if the password is incorrect
-				promptForPassword(extensionID); // Recursive call to keep asking for the correct password
-			} else {
-				checkCredentials(email, password)
-					.then(check => {
-						console.log('Credential check response:', JSON.stringify(check));
-						// Check for various success indicators from the API
-						// Handle both boolean (true) and number (1) responses
-						const isAuthenticated = check.authenticated === true || check.authenticated === 1 || check.success === true;
-						const isValid = check.validity === true || check.validity === 1 || check.valid === true || check.validity === undefined;
-
-						if (isAuthenticated && isValid) {
-							vscode.window.showInformationMessage('Password correct, access granted!');
-							process.context.globalState.update('isCurrentlyBlocked', false);
-							lastUnlockTime = Date.now(); // Set grace period
-						} else {
-							console.log('Auth failed - authenticated:', check.authenticated, 'validity:', check.validity);
-							vscode.window.showErrorMessage('Invalid credentials. Access denied.');
-							// Optionally, you can re-prompt the user if the password is incorrect
-							promptForPassword(extensionID); // Recursive call to keep asking for the correct password
-						}
-					})
-					.catch(err => {
-						console.log(err);
-						vscode.window.showErrorMessage(err);
-						// Optionally, you can re-prompt the user if the password is incorrect
-						promptForPassword(extensionID); // Recursive call to keep asking for the correct password
-					})
-			}
+			continue;
 		}
-	});
+
+		const hashIndex = value.indexOf('#');
+		const email = hashIndex >= 0 ? value.substring(0, hashIndex) : '';
+		const password = hashIndex >= 0 ? value.substring(hashIndex + 1) : '';
+
+		if (!email || !password) {
+			vscode.window.showErrorMessage('Missing credentials. Access denied.');
+			continue;
+		}
+
+		try {
+			const check = await checkCredentials(email, password);
+			const isAuthenticated = check.authenticated === true || check.authenticated === 1 || check.success === true;
+			const isValid = check.validity === true || check.validity === 1 || check.valid === true || check.validity === undefined;
+
+			if (isAuthenticated && isValid) {
+				vscode.window.showInformationMessage('Password correct, access granted!');
+				if (extensionContext) {
+					extensionContext.globalState.update('isCurrentlyBlocked', false);
+				}
+				lastUnlockTime = Date.now();
+				return;
+			}
+			vscode.window.showErrorMessage('Invalid credentials. Access denied.');
+		} catch (err) {
+			vscode.window.showErrorMessage(typeof err === 'string' ? err : 'Credential check failed.');
+		}
+	}
+
+	writeToLogFile(logFilePath, `Password prompt failed ${maxPasswordAttempts} times for banned extension ${extensionID}`);
+	// Clear the flag so the next poll re-prompts. Previously it stayed true and
+	// silenced the monitor for the rest of the session.
+	if (extensionContext) {
+		await extensionContext.globalState.update('isCurrentlyBlocked', false);
+	}
+	vscode.window.showErrorMessage(
+		`Maximum password attempts (${maxPasswordAttempts}) reached. IDE remains blocked until the next check.`
+	);
 }
 
 class MyViewProvider {
-	resolveWebviewView(webviewView, context, token) {
-		// Store reference to set badge
+	constructor(context) {
+		this._context = context;
+		this._examHtml = this._readView('exam.html');
+		this._lectureHtml = this._readView('lecture.html');
+	}
+
+	_readView(name) {
+		try {
+			return fs.readFileSync(path.join(this._context.extensionPath, 'media', 'views', name), 'utf8');
+		} catch (error) {
+			console.error(`Failed to read view ${name}:`, error);
+			return `<html><body><h1>${name}</h1></body></html>`;
+		}
+	}
+
+	resolveWebviewView(webviewView) {
 		this._view = webviewView;
-
-		// Configure webview options
-		webviewView.webview.options = {
-			enableScripts: true
-		};
-
+		webviewView.webview.options = { enableScripts: true };
 		this.updateContent(isExamModeActive);
 	}
 
@@ -329,171 +544,21 @@ class MyViewProvider {
 		if (!this._view) return;
 
 		if (isActive) {
-			// EXAM MODE
-			this._view.badge = {
-				value: 1,
-				tooltip: 'EXAM MODE - AI extensions blocked'
-			};
-			this._view.webview.html = `
-				<!DOCTYPE html>
-				<html lang="en">
-					<head>
-						<meta charset="UTF-8">
-						<meta name="viewport" content="width=device-width, initial-scale=1.0">
-						<style>
-							body {
-								background-color: #f44336;
-								color: white;
-								padding: 20px;
-								text-align: center;
-								font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-							}
-							.icon { margin: 10px auto; }
-							.status-badge {
-								display: inline-block;
-								background: rgba(255,255,255,0.2);
-								padding: 5px 15px;
-								border-radius: 20px;
-								margin: 10px 0;
-								font-weight: bold;
-							}
-							.feature-list {
-								text-align: left;
-								margin: 20px auto;
-								max-width: 250px;
-							}
-							.feature-item {
-								display: flex;
-								align-items: center;
-								margin: 8px 0;
-								font-size: 13px;
-							}
-							.feature-icon {
-								margin-right: 10px;
-								width: 20px;
-								text-align: center;
-							}
-							h1 { margin: 10px 0; }
-							h2 { margin: 5px 0; font-weight: normal; opacity: 0.9; }
-						</style>
-					</head>
-					<body>
-						<div class="icon">
-							<svg width="64" height="64" viewBox="0 0 24 24" fill="white">
-								<path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 10.99h7c-.53 4.12-3.28 7.79-7 8.94V12H5V6.3l7-3.11v8.8z"/>
-							</svg>
-						</div>
-						<h1>EXAM MODE</h1>
-						<div class="status-badge">ACTIVE</div>
-						<h2>AI Extension Blocking Enabled</h2>
-
-						<div class="feature-list">
-							<div class="feature-item">
-								<span class="feature-icon">&#10060;</span>
-								<span>AI extensions are blocked</span>
-							</div>
-							<div class="feature-item">
-								<span class="feature-icon">&#128065;</span>
-								<span>Activity is being monitored</span>
-							</div>
-							<div class="feature-item">
-								<span class="feature-icon">&#128274;</span>
-								<span>Instructor unlock required</span>
-							</div>
-							<div class="feature-item">
-								<span class="feature-icon">&#128221;</span>
-								<span>Actions logged to desktop</span>
-							</div>
-						</div>
-					</body>
-				</html>
-			`;
+			this._view.badge = { value: 1, tooltip: 'EXAM MODE - AI extensions blocked' };
+			this._view.webview.html = this._examHtml;
 		} else {
-			// LECTURE MODE
-			this._view.badge = {
-				value: 0,
-				tooltip: 'Lecture Mode - AI extensions allowed'
-			};
-			this._view.webview.html = `
-				<!DOCTYPE html>
-				<html lang="en">
-					<head>
-						<meta charset="UTF-8">
-						<meta name="viewport" content="width=device-width, initial-scale=1.0">
-						<style>
-							body {
-								background-color: #2196F3;
-								color: white;
-								padding: 20px;
-								text-align: center;
-								font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-							}
-							.icon { margin: 10px auto; }
-							.status-badge {
-								display: inline-block;
-								background: rgba(255,255,255,0.2);
-								padding: 5px 15px;
-								border-radius: 20px;
-								margin: 10px 0;
-								font-weight: bold;
-							}
-							.feature-list {
-								text-align: left;
-								margin: 20px auto;
-								max-width: 250px;
-							}
-							.feature-item {
-								display: flex;
-								align-items: center;
-								margin: 8px 0;
-								font-size: 13px;
-							}
-							.feature-icon {
-								margin-right: 10px;
-								width: 20px;
-								text-align: center;
-							}
-							h1 { margin: 10px 0; }
-							h2 { margin: 5px 0; font-weight: normal; opacity: 0.9; }
-						</style>
-					</head>
-					<body>
-						<div class="icon">
-							<svg width="64" height="64" viewBox="0 0 24 24" fill="white">
-								<path d="M12 3L1 9l4 2.18v6L12 21l7-3.82v-6l2-1.09V17h2V9L12 3zm6.82 6L12 12.72 5.18 9 12 5.28 18.82 9zM17 15.99l-5 2.73-5-2.73v-3.72L12 15l5-2.73v3.72z"/>
-							</svg>
-						</div>
-						<h1>LECTURE MODE</h1>
-						<div class="status-badge">INACTIVE</div>
-						<h2>AI Extension Blocking Disabled</h2>
-
-						<div class="feature-list">
-							<div class="feature-item">
-								<span class="feature-icon">&#9989;</span>
-								<span>AI extensions are allowed</span>
-							</div>
-							<div class="feature-item">
-								<span class="feature-icon">&#128218;</span>
-								<span>Learning mode active</span>
-							</div>
-							<div class="feature-item">
-								<span class="feature-icon">&#128275;</span>
-								<span>No restrictions applied</span>
-							</div>
-							<div class="feature-item">
-								<span class="feature-icon">&#128161;</span>
-								<span>Use AI tools freely</span>
-							</div>
-						</div>
-					</body>
-				</html>
-			`;
+			this._view.badge = { value: 0, tooltip: 'Lecture Mode - AI extensions allowed' };
+			this._view.webview.html = this._lectureHtml;
 		}
 	}
 }
 
-
 module.exports = {
 	activate,
-	deactivate
+	deactivate,
+	// Internals exposed for the integration tests only.
+	__test: {
+		enforceSetting, restoreSetting, restoreExamSettings, buildAllowedExtensionsValue, ENFORCED,
+		setExamMode: (active) => { isExamModeActive = active; },
+	},
 };
